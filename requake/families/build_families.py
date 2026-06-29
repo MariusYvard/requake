@@ -10,11 +10,17 @@ Build families of repeating earthquakes from a catalog of pairs.
     (https://www.gnu.org/licenses/gpl-3.0-standalone.html)
 """
 import logging
-import csv
 from itertools import combinations
 from scipy.cluster.hierarchy import average, fcluster
 from ..config import config, rq_exit
-from .pairs import read_events_from_pairs_file
+from ..database.db import DatabaseCorruptError, get_db_path
+from ..database.pairs import (
+    PairsMetadataError,
+    PairsSchemaError,
+    PairsTableNotFoundError,
+)
+from ..database.families import write_families as write_families_to_db
+from .pairs import read_events_from_pairs
 from .families import Family
 logger = logging.getLogger(__name__.rsplit('.', maxsplit=1)[-1])
 
@@ -34,25 +40,20 @@ def _check_options():
             'are not specified')
 
 
-def _build_families_from_shared_events(events, cc_min):
+def _build_families_from_shared_events(events):
     """
     Build families by clustering all event pairs sharing an event.
-
-    Valid event pairs are those with a correlation above cc_min.
 
     :param events: dictionary of events
     :type events: dict
     :return: list of families
     :rtype: list
     """
-    # Build families from events with correlation above cc_min
     families = []
     for ev in events.values():
         new_family = Family()
         new_family.append(ev)
         for evid, cc in ev.correlations.items():
-            if cc < cc_min:
-                continue
             new_family.append(events[evid])
         if len(new_family) == 1:
             continue
@@ -92,18 +93,18 @@ def _build_families_from_upgma(events, cc_min):
     # We use min_correlation for pairs for which no correlation is available
     evids = sorted(set(events.keys()))
     distances = {
-        k: 1-correlations.get(k, min_correlation)
+        k: 1 - correlations.get(k, min_correlation)
         for k in combinations(evids, 2)
     }
     # Build pairwise distance matrix, then the linkage matrix,
     # then the clusters
     pairwise_distances = [distances[k] for k in sorted(distances.keys())]
     linkage_matrix = average(pairwise_distances)
-    clusters = fcluster(linkage_matrix, 1-cc_min, criterion='distance')
+    clusters = fcluster(linkage_matrix, 1 - cc_min, criterion='distance')
     # Build families
     families = [Family(number=n) for n in range(max(clusters))]
     for evid, cluster in zip(evids, clusters):
-        families[cluster-1].append(events[evid])
+        families[cluster - 1].append(events[evid])
     # Remove families with only one event
     families = [f for f in families if len(f) > 1]
     return families
@@ -111,7 +112,7 @@ def _build_families_from_upgma(events, cc_min):
 
 def _write_families(families):
     """
-    Write families to file.
+    Write families to the SQLite database.
 
     :param families: list of families
     :type families: list
@@ -126,45 +127,48 @@ def _write_families(families):
         'distance_from': lambda f: f.distance_from(lon0, lat0)
     }
     families = sorted(families, key=sort_keys[sort_by])
-    with open(config.build_families_outfile, 'w', encoding='utf-8') as fp_out:
-        fieldnames = [
-            'evid', 'trace_id', 'orig_time', 'lon', 'lat', 'depth_km',
-            'mag_type', 'mag', 'family_number', 'valid'
-        ]
-        writer = csv.writer(fp_out)
-        writer.writerow(fieldnames)
-        valid = True  # families are valid by default
-        for number, family in enumerate(families):
-            for ev in family:
-                writer.writerow([
-                    ev.evid, ev.trace_id, ev.orig_time, ev.lon, ev.lat,
-                    ev.depth, ev.mag_type, ev.mag, number, valid
-                ])
+    valid = True  # families are valid by default
+    for number, family in enumerate(families):
+        family.number = number
+        family.valid = valid
+    write_families_to_db(families)
 
 
 def build_families():
-    """
-    Build families of repeating earthquakes from a catalog of pairs.
-    """
+    """Build families of repeating earthquakes from a catalog of pairs."""
     try:
         _check_options()
     except ValueError as msg:
         logger.error(msg)
         rq_exit(1)
     try:
-        logger.info('Reading events from pairs file...')
-        events = read_events_from_pairs_file()
-    except FileNotFoundError:
-        logger.error(
-            'Unable to find event pairs file: '
-            f'{config.scan_catalog_pairs_file}'
+        logger.info(
+            'Reading events from event pairs in '
+            f'db file {get_db_path()}...'
         )
+        cc_min = (
+            config.cc_min
+            if config.clustering_algorithm == 'shared'
+            else None
+        )
+        events = read_events_from_pairs(cc_min=cc_min)
+    except (FileNotFoundError, PairsTableNotFoundError):
+        logger.error(
+            'Unable to find event pairs in database: '
+            f'{get_db_path()}'
+        )
+        rq_exit(1)
+    except (PairsMetadataError, PairsSchemaError) as msg:
+        logger.error(msg)
+        rq_exit(1)
+    except DatabaseCorruptError as msg:
+        logger.error(msg)
         rq_exit(1)
     if config.clustering_algorithm == 'shared':
         logger.info('Building families from shared events...')
-        families = _build_families_from_shared_events(events, config.cc_min)
+        families = _build_families_from_shared_events(events)
     elif config.clustering_algorithm == 'UPGMA':
         logger.info('Building families using UPGMA...')
         families = _build_families_from_upgma(events, config.cc_min)
     _write_families(families)
-    logger.info(f'Done! Output written to: {config.build_families_outfile}')
+    logger.info(f'Done! Output written to: {get_db_path()}')

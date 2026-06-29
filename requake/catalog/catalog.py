@@ -11,7 +11,6 @@ Classes and functions for downloading, reading and writing catalogs.
 """
 import numpy as np
 from obspy import UTCDateTime
-from ..config import config
 from ..formulas import float_or_none
 from ..waveforms import get_traceid_coords
 
@@ -28,6 +27,7 @@ class RequakeEvent():
                  depth=None, mag_type=None, mag=None, author=None,
                  catalog=None, contributor=None, contributor_id=None,
                  mag_author=None, location_name=None, trace_id=None):
+        """Initialize an event container."""
         self.evid = evid
         self.orig_time = orig_time
         self.lon = lon
@@ -45,24 +45,31 @@ class RequakeEvent():
         self.correlations = {}
 
     def __eq__(self, other):
+        """Return True when two events have the same identity."""
         return self.evid == other.evid and self.trace_id == other.trace_id
 
     def __gt__(self, other):
+        """Compare events by origin time."""
         return self.orig_time > other.orig_time
 
     def __ge__(self, other):
+        """Compare events by origin time."""
         return self.orig_time >= other.orig_time
 
     def __lt__(self, other):
+        """Compare events by origin time."""
         return self.orig_time < other.orig_time
 
     def __le__(self, other):
+        """Compare events by origin time."""
         return self.orig_time <= other.orig_time
 
     def __hash__(self):
+        """Return the event hash."""
         return self.evid.__hash__()
 
     def __str__(self):
+        """Return a compact string representation of the event."""
         return (
             f'{self.evid} {self.orig_time} '
             f'{self.lon} {self.lat} {self.depth} {self.mag_type} {self.mag}'
@@ -148,46 +155,12 @@ class RequakeCatalog(list):
         """
         self[:] = sorted(self, key=lambda ev: ev.orig_time)
 
-    def read(self, filename):
-        """
-        Read catalog from FDSN text file format.
-
-        Skips events already in the catalog.
-
-        :param filename: input filename
-        :type filename: str
-
-        :raises FileNotFoundError: if filename does not exist
-        :raises ValueError: if line is not in FDSN text file format
-        """
-        with open(filename, 'r', encoding='utf8') as fp:
-            for line in fp:
-                if not line:
-                    continue
-                if line[0] == '#':
-                    continue
-                ev = RequakeEvent()
-                ev.from_fdsn_text(line)
-                self.append(ev)
-        self.deduplicate()
-
-    def write(self, filename):
-        """
-        Write catalog in FDSN text file format.
-
-        :param filename: output filename
-        :type filename: str
-        """
-        with open(filename, 'w', encoding='utf8') as fp:
-            for ev in self:
-                fp.write(ev.fdsn_text() + '\n')
-
     def filter(
-            self, starttime=None, endtime=None,
-            minlatitude=None, maxlatitude=None,
-            minlongitude=None, maxlongitude=None,
-            mindepth=None, maxdepth=None,
-            minmagnitude=None, maxmagnitude=None
+        self, starttime=None, endtime=None,
+        minlatitude=None, maxlatitude=None,
+        minlongitude=None, maxlongitude=None,
+        mindepth=None, maxdepth=None,
+        minmagnitude=None, maxmagnitude=None
     ):
         """
         Filter the catalog, based on the specified criteria.
@@ -220,60 +193,47 @@ class RequakeCatalog(list):
         """
         outcat = RequakeCatalog()
         for ev in self:
-            if ev.orig_time is not None:
-                if starttime is not None and ev.orig_time < starttime:
-                    continue
-                if endtime is not None and ev.orig_time > endtime:
-                    continue
-            if ev.lat is not None:
-                if minlatitude is not None and ev.lat < minlatitude:
-                    continue
-                if maxlatitude is not None and ev.lat > maxlatitude:
-                    continue
-            if ev.lon is not None:
-                if minlongitude is not None and ev.lon < minlongitude:
-                    continue
-                if maxlongitude is not None and ev.lon > maxlongitude:
-                    continue
-            if ev.depth is not None:
-                if mindepth is not None and ev.depth < mindepth:
-                    continue
-                if maxdepth is not None and ev.depth > maxdepth:
-                    continue
-            if ev.mag is not None:
-                if minmagnitude is not None and ev.mag < minmagnitude:
-                    continue
-                if maxmagnitude is not None and ev.mag > maxmagnitude:
-                    continue
+            if _out_of_range(ev.orig_time, starttime, endtime):
+                continue
+            if _out_of_range(ev.lat, minlatitude, maxlatitude):
+                continue
+            if _out_of_range(ev.lon, minlongitude, maxlongitude):
+                continue
+            if _out_of_range(ev.depth, mindepth, maxdepth):
+                continue
+            if _out_of_range(ev.mag, minmagnitude, maxmagnitude):
+                continue
             outcat.append(ev)
         return outcat
 
 
+def _out_of_range(value, minimum, maximum):
+    """Return True when a value falls outside the requested bounds."""
+    if value is None:
+        return False
+    return (
+        (minimum is not None and value < minimum)
+        or (maximum is not None and value > maximum)
+    )
+
+
 def read_stored_catalog():
     """
-    Read the catalog stored in the output directory.
+    Read the catalog stored in the output database.
 
     :return: Catalog object.
     :rtype: RequakeCatalog
 
-    :raises ValueError: if error reading catalog file
-    :raises FileNotFoundError: if catalog file not found
+    :raises ValueError: if the stored catalog is empty
+    :raises FileNotFoundError: if the output database is not found
     """
-    try:
-        cat = RequakeCatalog()
-        cat.read(config.scan_catalog_file)
-        cat.sort()
-        if not cat:
-            raise ValueError('Empty catalog')
-        return cat
-    except ValueError as err:
-        raise ValueError(
-            f'Error reading catalog file {config.scan_catalog_file}: {err}'
-        ) from err
-    except (FileNotFoundError, NotADirectoryError) as err:
-        raise FileNotFoundError(
-            f'Catalog file {config.scan_catalog_file} not found'
-        ) from err
+    from ..database.catalog import read_catalog as read_catalog_from_db
+
+    cat = read_catalog_from_db()
+    cat.sort()
+    if not cat:
+        raise ValueError('Empty catalog')
+    return cat
 
 
 def fix_non_locatable_events(catalog):
@@ -285,7 +245,7 @@ def fix_non_locatable_events(catalog):
     """
     if not any(ev.lat is None or ev.lon is None for ev in catalog):
         return
-    traceid_coords = get_traceid_coords(config)
+    traceid_coords = get_traceid_coords()
     mean_lat = np.mean([
         coords['latitude'] for coords in traceid_coords.values()])
     mean_lon = np.mean([
@@ -308,9 +268,9 @@ def _base26(val):
     :rtype: str
     """
     chars = [
-      'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
-      'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
-      'u', 'v', 'w', 'x', 'y', 'z'
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+        'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+        'u', 'v', 'w', 'x', 'y', 'z'
     ]
     base = len(chars)
     ret = ''
@@ -337,7 +297,7 @@ def generate_evid(orig_time):
     orig_year = UTCDateTime(year=year, month=1, day=1)
     val = int(orig_time - orig_year)
     # normalize val between 0 (aaaaaa) and 26**6-1 (zzzzzz)
-    maxval = 366*24*3600  # max number of seconds in leap year
-    normval = int(val/maxval * (26**6-1))
+    maxval = 366 * 24 * 3600  # max number of seconds in leap year
+    normval = int(val / maxval * (26 ** 6 - 1))
     ret = _base26(normval)
     return f'{prefix}{year}{ret}'

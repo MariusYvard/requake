@@ -18,9 +18,8 @@ from .._version import get_versions
 
 
 class NewlineHelpFormatter(argparse.HelpFormatter):
-    """
-    Custom help formatter that preserves newlines in help messages.
-    """
+    """Custom help formatter that preserves newlines in help messages."""
+
     def _split_lines(self, text, width):
         lines = []
         for line in text.splitlines():  # Split the text by newlines first
@@ -36,11 +35,11 @@ class NewlineHelpFormatter(argparse.HelpFormatter):
 
 class SubcommandHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """
-    Custom help formatter that removes the list of subcommands from the help
-    message.
+    Custom help formatter that removes the subcommand list from help.
 
     See: https://stackoverflow.com/a/13429281/2021880
     """
+
     def _format_action(self, action):
         parts = super(
             argparse.RawDescriptionHelpFormatter, self
@@ -48,6 +47,21 @@ class SubcommandHelpFormatter(argparse.RawDescriptionHelpFormatter):
         if action.nargs == argparse.PARSER:
             parts = '\n'.join(parts.split('\n')[1:])
         return parts
+
+
+def _nonnegative_int(value):
+    """Argparse type for integers >= 0."""
+    try:
+        int_value = int(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(
+            f'invalid non-negative integer value: {value}'
+        ) from err
+    if int_value < 0:
+        raise argparse.ArgumentTypeError(
+            f'invalid non-negative integer value: {value}'
+        )
+    return int_value
 
 
 def parse_arguments(progname='requake'):
@@ -130,7 +144,7 @@ def parse_arguments(progname='requake'):
             '- CSV\n'
             '- Space-separated text files.\n\n'
             'For CSV or space-separated formats, the file must include '
-            'at least one column for the event\'s origin time '
+            "at least one column for the event's origin time "
             'and may contain additional columns for event ID, longitude, '
             'latitude, depth, and magnitude. Column names '
             'must be specified in the first row.\n\n'
@@ -152,6 +166,10 @@ def parse_arguments(progname='requake'):
         choices=['simple', 'markdown', 'csv'],
         help='format for the output table (default: %(default)s)'
     )
+    print_format.add_argument(
+        '--no-pager', action='store_true',
+        help='disable the interactive curses pager'
+    )
     # ---
     # --- print_catalog
     subparser.add_parser(
@@ -161,10 +179,29 @@ def parse_arguments(progname='requake'):
     )
     # ---
     # --- scan_catalog
-    subparser.add_parser(
+    scan_catalog = subparser.add_parser(
         'scan_catalog',
-        parents=[force],
         help='scan an existing catalog for earthquake pairs'
+    )
+    scan_catalog_mode = scan_catalog.add_mutually_exclusive_group()
+    scan_catalog_mode.add_argument(
+        '-f',
+        '--force',
+        action='store_true',
+        help='delete existing event pairs and restart the scan'
+    )
+    scan_catalog_mode.add_argument(
+        '-c',
+        '--force-continue',
+        action='store_true',
+        help='continue an interrupted scan and keep existing event pairs'
+    )
+    scan_catalog.add_argument(
+        '--nprocs',
+        type=_nonnegative_int,
+        default=None,
+        help='number of worker processes for scan_catalog '
+             '(0: auto, 1: disable parallelism)'
     )
     # ---
     # --- print_pairs
@@ -182,6 +219,10 @@ def parse_arguments(progname='requake'):
         '-C', '--cc_max',
         type=float, default=None,
         help='maximum cross-correlation coefficient (default: %(default)s)'
+    )
+    print_pairs.add_argument(
+        '--force', action='store_true',
+        help='skip the large-dataset warning'
     )
     # ---
     # --- traceid
@@ -325,9 +366,14 @@ def parse_arguments(progname='requake'):
     print_families = subparser.add_parser(
         'print_families',
         parents=[
-            longerthan, shorterthan, minevents, family_numbers, print_format
+            longerthan, shorterthan, minevents, family_numbers
         ],
         help='print families to screen'
+    )
+    print_families.add_argument(
+        '-f', '--format', type=str, default='simple',
+        choices=['simple', 'markdown', 'csv', 'stats'],
+        help='format for the output (default: %(default)s)'
     )
     print_families.add_argument(
         '-d', '--detailed', action='store_true',
@@ -460,6 +506,179 @@ def parse_arguments(progname='requake'):
              '"A" header field'
     )
     # ---
+    # --- wfcache
+    wfcache = subparser.add_parser(
+        'wfcache',
+        help='manage persistent waveform cache'
+    )
+    wfcache_sub = wfcache.add_subparsers(dest='wfcache_action')
+    wfcache_sub.required = True
+
+    wfcache_row_filters = argparse.ArgumentParser(add_help=False)
+    wfcache_row_filters.add_argument(
+        '--event-id',
+        action='append',
+        default=[],
+        help='event ID filter (repeatable)'
+    )
+    wfcache_row_filters.add_argument(
+        '--event-id-file',
+        type=str,
+        default=None,
+        help='path to text file with event IDs'
+    )
+    wfcache_row_filters.add_argument(
+        '--trace-id',
+        action='append',
+        default=[],
+        help='trace-ID filter (repeatable)'
+    )
+    wfcache_row_filters.add_argument(
+        '--start-time',
+        type=str,
+        default=None,
+        help='minimum start time (UTCDateTime-compatible string)'
+    )
+    wfcache_row_filters.add_argument(
+        '--end-time',
+        type=str,
+        default=None,
+        help='maximum end time (UTCDateTime-compatible string)'
+    )
+    wfcache_row_filters.add_argument(
+        '--limit',
+        type=_nonnegative_int,
+        default=None,
+        help='limit number of returned rows'
+    )
+
+    wfcache_prefetch = wfcache_sub.add_parser(
+        'prefetch',
+        help='prefetch waveform windows into the persistent cache'
+    )
+    wfcache_prefetch.add_argument(
+        '--event-id',
+        action='append',
+        default=[],
+        help='event ID filter (repeatable)'
+    )
+    wfcache_prefetch.add_argument(
+        '--event-id-file',
+        type=str,
+        default=None,
+        help='path to text file with event IDs'
+    )
+    wfcache_prefetch.add_argument(
+        '--trace-id',
+        action='append',
+        default=[],
+        help='trace-ID filter (repeatable)'
+    )
+    wfcache_prefetch.add_argument(
+        '--max-events',
+        type=_nonnegative_int,
+        default=None,
+        help='maximum number of catalog events to prefetch'
+    )
+    wfcache_prefetch.add_argument(
+        '--batch-size',
+        type=_nonnegative_int,
+        default=500,
+        help='progress logging batch size (default: %(default)s)'
+    )
+    wfcache_prefetch.add_argument(
+        '--group-window',
+        type=str,
+        default='1h',
+        metavar='DURATION',
+        help='max grouped download span (e.g., 30m, 1h; default: '
+             '%(default)s)'
+    )
+    wfcache_prefetch.set_defaults(action='wfcache_prefetch')
+
+    wfcache_print = wfcache_sub.add_parser(
+        'print',
+        parents=[wfcache_row_filters],
+        help='print cached waveform rows'
+    )
+    wfcache_print.add_argument(
+        '--json',
+        action='store_true',
+        help='print rows as JSON'
+    )
+    wfcache_print.set_defaults(action='wfcache_print')
+
+    wfcache_inspect = wfcache_sub.add_parser(
+        'inspect',
+        help='print persistent waveform-cache summary'
+    )
+    wfcache_inspect.add_argument(
+        '--integrity',
+        action='store_true',
+        help='run PRAGMA integrity_check'
+    )
+    wfcache_inspect.add_argument(
+        '--json',
+        action='store_true',
+        help='print summary as JSON'
+    )
+    wfcache_inspect.set_defaults(action='wfcache_inspect')
+
+    wfcache_extract = wfcache_sub.add_parser(
+        'extract',
+        parents=[wfcache_row_filters],
+        help='extract cached waveforms to external files'
+    )
+    wfcache_extract.add_argument(
+        '--format',
+        type=str,
+        choices=['mseed', 'sac'],
+        default='mseed',
+        help='output format (default: %(default)s)'
+    )
+    wfcache_extract.add_argument(
+        '--output-dir',
+        type=str,
+        default='waveform_cache',
+        help='output directory (default: %(default)s)'
+    )
+    wfcache_extract.set_defaults(action='wfcache_extract')
+
+    wfcache_reset = wfcache_sub.add_parser(
+        'reset-failures',
+        help='reset persistent waveform failure-cache rows'
+    )
+    wfcache_reset.add_argument(
+        '--event-id',
+        action='append',
+        default=[],
+        help='event ID to reset (repeatable)'
+    )
+    wfcache_reset.add_argument(
+        '--event-id-file',
+        type=str,
+        default=None,
+        help='path to text file with event IDs to reset'
+    )
+    wfcache_reset.add_argument(
+        '--all',
+        action='store_true',
+        help='reset all failure rows'
+    )
+    wfcache_reset.add_argument(
+        '--older-than',
+        type=str,
+        default=None,
+        metavar='DURATION',
+        help='reset rows older than DURATION (e.g., 6h, 7d)'
+    )
+    wfcache_reset.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='show affected rows without deleting'
+    )
+    wfcache_reset.set_defaults(action='wfcache_reset_failures')
+    # ---
     argcomplete.autocomplete(parser)
     args = parser.parse_args()
     if args.action is None:
@@ -472,8 +691,8 @@ def parse_arguments(progname='requake'):
         pass
     except ValueError:
         sys.stderr.write(
-            f"{progname} {args.action}: "
-            "error: argument -l/--longerthan: "
+            f'{progname} {args.action}: '
+            'error: argument -l/--longerthan: '
             f"invalid value: '{args.longerthan}'\n"
         )
         sys.exit(2)
@@ -483,8 +702,8 @@ def parse_arguments(progname='requake'):
         pass
     except ValueError:
         sys.stderr.write(
-            f"{progname} {args.action}: "
-            "error: argument -S/--shorterthan: "
+            f'{progname} {args.action}: '
+            'error: argument -S/--shorterthan: '
             f"invalid value: '{args.shorterthan}'\n"
         )
         sys.exit(2)
@@ -513,13 +732,13 @@ def _timespec_to_sec(timespec):
     elif suffix == 'm':
         time_in_seconds *= 60
     elif suffix == 'h':
-        time_in_seconds *= 24*60
+        time_in_seconds *= 24 * 60
     elif suffix == 'd':
-        time_in_seconds *= 24*60*60
+        time_in_seconds *= 24 * 60 * 60
     elif suffix == 'M':
-        time_in_seconds *= 30*24*60*60
+        time_in_seconds *= 30 * 24 * 60 * 60
     elif suffix == 'y':
-        time_in_seconds *= 365*24*60*60
+        time_in_seconds *= 365 * 24 * 60 * 60
     else:
-        raise ValueError(f"Invalid time specification: {timespec}")
+        raise ValueError(f'Invalid time specification: {timespec}')
     return time_in_seconds

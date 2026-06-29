@@ -4,6 +4,77 @@ Copyright (c) 2021-2026 Claudio Satriano <satriano@ipgp.fr>
 
 ## [unreleased]
 
+- New interactive curses pager for all ``print_`` commands
+  (``print_catalog``, ``print_pairs``, ``print_families``).
+  Automatically activated when output is a terminal; use ``--no-pager``
+  to fall back to plain-text output.
+
+## [0.8.3] - 2026-06-19
+
+Note: you should run `requake update_config` to update your config file
+to the latest version.
+
+The waveform disk cache is now a single SQLite database
+(`OUTDIR/waveform_cache.sqlite`) with a persistent negative cache that
+remembers failed downloads across runs, eliminating redundant HTTP requests.
+
+- New `wfcache` CLI: `prefetch`, `print`/`inspect`, `extract`,
+  `reset-failures`.
+- New config: `catalog_waveform_cache_failure_max_retries`,
+  `catalog_waveform_cache_failure_backoff_s`,
+  `catalog_waveform_require_prefetch`.
+- Several optimization for parallel runs in `scan_catalog` (especially on
+  Slurm clusters) and for startup time of `scan_catalog -c` (continue an
+  interrupted scan).
+- Extended documentation for `read_catalog`, `scan_catalog` and `wfcache`.
+
+## [0.8.2] - 2026-06-03
+
+Note: you might want to run `requake update_config` to update your config file
+to the latest version.
+
+- Parallel processing of earthquake pairs in `scan_catalog`. On by default
+  with automatic detection of the number of worker processes. This can be
+  configured with the `catalog_scan_nprocs` config option.
+
+## [0.8.1] - 2026-05-31
+
+- Slimmed-down DB size by optimizing `event_pairs` storage. This allows storing
+  also invalid pairs, so that resuming catalog scan is faster.
+- Dramatic speedup of event pairs building by using a KD-tree
+  spatial index and approximate geodetic distance calculations.
+- Dramatic speedup of waveform fetching by improving the caching mechanism.
+  A new config option `catalog_waveform_cache_size` allows to set the maximum
+  number of waveforms to cache.
+- Dramatically faster reading of event pairs with cross-correlation
+  filters in large catalogs, thanks to the new SQLite-backed storage.
+- Add an optional disk cache, through the `catalog_waveform_disk_cache_enabled`
+  config option.
+- `scan_catalog`: when running as a batch job, log a progress
+  report every minute, instead of showing the progress bar.
+- `scan_catalog`: if event pairs already exist in the database,
+  ask whether to overwrite or continue from an interrupted run.
+  Add `--force` to restart from scratch and `--force-continue`
+  (short `-c`) to resume without prompting.
+- `print_families`: add horizontal and vertical distance min/max values
+  to both summary and detailed (`-d`) outputs.
+- `print_families`: add `-f stats` output format for summary family
+  statistics.
+
+## [0.8] - 2026-05-22
+
+This release introduces a major storage change.
+
+Requake now stores scan-related data (catalog, event pairs, and families) in a
+SQLite database instead of CSV files. This improves storage efficiency and
+data access performance, especially for large catalogs.
+
+This change is not backward compatible at the data format level. The
+high-level behavior of the command-line interface remains unchanged.
+
+Note: further improvements based on this new storage system will be introduced
+throughout the 0.8.x release series.
+
 ## [0.7.3] - 2026-04-14
 
 This release is intended to validate the new release workflow.
@@ -142,7 +213,11 @@ Mostly a bugfix release with a slightly improved trace plotting.
 
 - Initial release, not yet feature complete
 
-[unreleased]: https://github.com/SeismicSource/requake/compare/v0.7.3...HEAD
+[unreleased]: https://github.com/SeismicSource/requake/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/SeismicSource/requake/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/SeismicSource/requake/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/SeismicSource/requake/compare/v0.8...v0.8.1
+[0.8]: https://github.com/SeismicSource/requake/compare/v0.7.3...v0.8
 [0.7.3]: https://github.com/SeismicSource/requake/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/SeismicSource/requake/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/SeismicSource/requake/compare/v0.7...v0.7.1

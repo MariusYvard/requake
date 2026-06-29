@@ -101,6 +101,15 @@ You can keep your local Requake repository updated by running `git pull`
 from times to times. Thanks to `pip`'s "editable mode", you don't need to
 reinstall Requake after each update.
 
+If you want the repository style rules to run locally before each commit,
+enable the included git hook once per clone:
+
+    scripts/setup_local_hooks.sh
+
+You can also run the local style checks manually with:
+
+    scripts/check_style.sh
+
 ## Running
 
 ### Command line arguments
@@ -133,6 +142,8 @@ Different commands are available:
                         families
     scan_templates      scan a continuous waveform stream using one or more
                         templates
+    wfcache             manage persistent waveform cache (prefetch, print,
+                        inspect, extract, reset_failures)
 
 Certain commands (e.g., `plot_pair`) require further arguments (use, e.g.,
 `requake plot_pair -h` to get help).
@@ -168,6 +179,14 @@ Now, build the catalog of event pairs with:
 
     requake scan_catalog
 
+When relying on FDSN web services for waveform data, it is strongly
+recommended to prefetch all waveform windows before running the scan.
+This downloads every required waveform once and stores it in a local
+SQLite cache, avoiding repeated downloads and dramatically reducing
+overall runtime for large catalogs:
+
+    requake wfcache prefetch
+
 Once done ([it will take time!](#performances)), you are ready to build
 repeating earthquake families:
 
@@ -175,11 +194,20 @@ repeating earthquake families:
 
 ## Performances
 
-- `requake scan_catalog` took 53 minutes on my 2.7 GHz i7 MacBook Pro to
-process 14,100,705 earthquake pairs.
-Dowloaded traces are cached in memory to speed up execution. Processing is not
-yet parallel: some improvements might come in future versions, when
-parallelization will be implemented.
+- `requake scan_catalog` is designed to fully utilize available CPU cores by
+  processing earthquake pairs in parallel. On an M2 MacBook Air, scanning
+  95,034 earthquake pairs downloaded via FDSNWS took approximately 5 minutes
+  using 7 worker processes, yielding ~19,000 pairs per minute. When repeating
+  the same scan with a fully cached set of waveforms, runtime dropped to 84
+  seconds (~68,000 pairs per minute). These results indicate that overall
+  performance is typically dominated by waveform download latency rather than
+  computation.
+
+- For large FDSN-based runs, use `requake wfcache prefetch` before
+  `requake scan_catalog` to download all waveforms upfront into a local
+  SQLite cache.  This eliminates repeated downloads, lets the scan read
+  exclusively from disk, and is the single most effective way to speed up
+  catalog scanning.
 
 - `requake build_families` is fast™.
 
@@ -193,7 +221,7 @@ If you used Requake for a scientific paper, please cite it as:
 Please replace `X.Y` with the Requake version number you used.
 
 You can also cite the following abstract presented at the
-2016 AGU Fall Meeting:
+2021 AGU Fall Meeting:
 
 > Satriano, C., Doucet, A. & Bouin, M.-P. (2021).
 > Probing the creep rate along the Lesser Antilles Subduction Zone through repeating earthquakes.

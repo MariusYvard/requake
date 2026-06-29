@@ -16,21 +16,110 @@ from obspy import read
 from obspy import Stream, UTCDateTime
 from obspy.geodetics import gps2dist_azimuth, locations2degrees
 from obspy.signal.cross_correlation import correlate, xcorr_max
-from obspy.clients.fdsn.header import FDSNNoDataException
+from obspy.clients.fdsn.header import FDSNException, FDSNNoDataException
 from scipy.stats import median_abs_deviation
 from ..config import config, rq_exit
+from ..wfcache import (
+    clear_waveform_failure,
+    read_cache_meta,
+    read_waveform_from_cache,
+    register_waveform_failure,
+    should_skip_waveform_download,
+    write_waveform_to_cache,
+)
 from .station_metadata import get_traceid_coords, MetadataMismatchError
 from .arrivals import get_arrivals
 logger = logging.getLogger(__name__.rsplit('.', maxsplit=1)[-1])
+
+
+WAVEFORM_CACHE_STATS = {
+    'disk_cache_hits': 0,
+    'disk_cache_misses': 0,
+    'disk_cache_writes': 0,
+    'disk_cache_read_errors': 0,
+    'disk_cache_write_errors': 0,
+}
 
 
 class NoWaveformError(Exception):
     """Exception raised for missing waveform data."""
 
 
+def _error_message(err):
+    """Return a robust one-line message for any exception."""
+    try:
+        message = str(err)
+    except Exception as str_err:  # pylint: disable=broad-except
+        err_type = type(err).__name__
+        str_err_type = type(str_err).__name__
+        return (
+            f'Unable to format {err_type} message '
+            f'({str_err_type} raised while converting to string).'
+        )
+    return message.replace('\n', ' ')
+
+
+def _increment_waveform_cache_stat(stat_name):
+    """Increment a waveform cache statistic."""
+    WAVEFORM_CACHE_STATS[stat_name] += 1
+
+
+def get_waveform_cache_stats():
+    """Return global waveform disk-cache statistics."""
+    return dict(WAVEFORM_CACHE_STATS)
+
+
+def _read_waveform_from_disk_cache(evid, traceid, starttime, endtime):
+    """Read a waveform window from persistent cache when available."""
+    import time as _time
+    t_start = _time.monotonic()
+    try:
+        tr = read_waveform_from_cache(evid, traceid, starttime, endtime)
+    except Exception as err:  # pylint: disable=broad-except
+        _increment_waveform_cache_stat('disk_cache_read_errors')
+        logger.warning(
+            'Ignoring unreadable waveform cache row '
+            f'for {evid}/{traceid}: {err}'
+        )
+        return None
+    dt = _time.monotonic() - t_start
+    if dt > 5.0:
+        logger.warning(
+            '[rq:perf] Slow disk cache read: evid=%s traceid=%s '
+            'dt=%.1fs hit=%s',
+            evid, traceid, dt, tr is not None,
+        )
+    if tr is None:
+        _increment_waveform_cache_stat('disk_cache_misses')
+        return None
+    _increment_waveform_cache_stat('disk_cache_hits')
+    return tr
+
+
+def _write_waveform_to_disk_cache(evid, traceid, starttime, endtime, tr):
+    """Persist a waveform window to disk cache."""
+    try:
+        written = write_waveform_to_cache(
+            evid, traceid, starttime, endtime, tr
+        )
+    except Exception as err:  # pylint: disable=broad-except
+        _increment_waveform_cache_stat('disk_cache_write_errors')
+        logger.warning(
+            'Unable to write waveform cache row '
+            f'for {evid}/{traceid}: {err}'
+        )
+        return False
+    if written:
+        _increment_waveform_cache_stat('disk_cache_writes')
+    return written
+
+
 def get_waveform_from_client(traceid, starttime, endtime):
     """
     Get a waveform from a FDSN or SDS client.
+
+    The FDSN dataselect client is created lazily on first use to avoid
+    unnecessary network I/O when waveforms come from the disk cache.
 
     :param traceid: trace id
     :type traceid: str
@@ -43,6 +132,15 @@ def get_waveform_from_client(traceid, starttime, endtime):
     :rtype: obspy.Trace
     """
     client = config.dataselect_client
+    if client is None and config.event_data_path is None:
+        # Lazy-init FDSN dataselect client
+        from obspy.clients.fdsn import Client as FDSNClient
+        client = FDSNClient(config.fdsn_dataselect_url)
+        config.dataselect_client = client
+        logger.info(
+            'Connected to FDSN dataselect server: '
+            f'{config.fdsn_dataselect_url}'
+        )
     if client is None:
         raise NoWaveformError(
             'No dataselect_client defined in the config file')
@@ -53,7 +151,7 @@ def get_waveform_from_client(traceid, starttime, endtime):
             starttime=starttime, endtime=endtime
         )
     except FDSNNoDataException as err:
-        msg = str(err).replace('\n', ' ')
+        msg = _error_message(err)
         raise NoWaveformError(
             f'No waveform data for trace id: {traceid} '
             f'between {starttime} and {endtime}\n'
@@ -62,10 +160,17 @@ def get_waveform_from_client(traceid, starttime, endtime):
     # ObsPy FDSN client raises an AttributeError when a timeout occurs
     # (this is a bug in ObsPy)
     except AttributeError as err:
-        msg = str(err).replace('\n', ' ')
+        msg = _error_message(err)
         raise NoWaveformError(
             f'Timeout occurred while trying '
             f'to get waveform data for trace id: {traceid} '
+            f'between {starttime} and {endtime}\n'
+            f'Error message: {msg}'
+        ) from err
+    except FDSNException as err:
+        msg = _error_message(err)
+        raise NoWaveformError(
+            f'Unable to get waveform data for trace id: {traceid} '
             f'between {starttime} and {endtime}\n'
             f'Error message: {msg}'
         ) from err
@@ -77,15 +182,13 @@ def get_waveform_from_client(traceid, starttime, endtime):
             f'No waveform data for trace id: {traceid} '
             f'between {starttime} and {endtime}'
         )
-    tr = st[0]
-    tr.detrend(type='demean')
-    return tr
+    return st[0]
 
 
 def _get_arrivals_and_distance(
         trace_lat, trace_lon, ev_lat, ev_lon, ev_depth, orig_time):
     """
-    Get arrivals and distance for a given trace and event
+    Get arrivals and distance for a given trace and event.
 
     :param trace_lat: latitude of the trace
     :type trace_lat: float
@@ -115,10 +218,11 @@ def _get_arrivals_and_distance(
     return p_arrival_time, s_arrival_time, distance, dist_deg
 
 
-def _get_event_waveform_from_client(evid, traceid, p_arrival_time):
+def _get_event_waveform_from_client(
+    evid, traceid, p_arrival_time, orig_time=None
+):
     """
-    Get a waveform for a given event and traceid through
-    an FDSN or SDS client.
+    Get a waveform for a given event and trace id via a waveform client.
 
     :param evid: event id
     :type evid: str
@@ -126,32 +230,103 @@ def _get_event_waveform_from_client(evid, traceid, p_arrival_time):
     :type traceid: str
     :param p_arrival_time: P arrival time
     :type p_arrival_time: obspy.UTCDateTime
+    :param orig_time: event origin time (needed for standardized windows)
+    :type orig_time: obspy.UTCDateTime or None
 
     :return: waveform trace
     :rtype: obspy.Trace
 
     :raises NoWaveformError: if no waveform data is available
     """
+    # When standardized offsets have been persisted by a prefetch run,
+    # use them to produce cache keys identical to those written by the
+    # prefetcher.  Otherwise fall back to per-event arrival computation.
+    if orig_time is not None:
+        tp_min_s = read_cache_meta(f'tp_min_{traceid}')
+        tp_max_s = read_cache_meta(f'tp_max_{traceid}')
+    else:
+        tp_min_s = tp_max_s = None
     pre_p = config.cc_pre_P
     trace_length = config.cc_trace_length
-    t0 = p_arrival_time - pre_p
-    t1 = t0 + trace_length
+    if tp_min_s is not None and tp_max_s is not None:
+        # Standardized offsets (from wfcache_prefetch) are raw P-arrival
+        # travel times.  Apply the same padding used by _build_prefetch_request
+        # so that cache keys match the windows stored during prefetch.
+        t0 = orig_time + float(tp_min_s) - pre_p
+        t1 = orig_time + float(tp_max_s) + trace_length
+    else:
+        t0 = p_arrival_time - pre_p
+        t1 = t0 + trace_length
+    # Three-tier decision for each waveform request:
+    # 1. Positive cache hit  → return immediately.
+    # 2. Negative cache hit  → skip (backoff / retry-limit logic).
+    # 3. require_prefetch    → silent skip: when enabled, absence
+    #    from both caches means the prefetch already tried and
+    #    failed, so a live request would be wasted.
+    # 4. Otherwise            → live HTTP fetch.
+    tr = _read_waveform_from_disk_cache(evid, traceid, t0, t1)
+    if tr is not None:
+        return tr
+    skip_download, skip_reason = should_skip_waveform_download(
+        evid,
+        traceid,
+        t0,
+        t1,
+    )
+    if skip_download:
+        raise NoWaveformError(
+            f'Skipping download for event {evid} and trace_id {traceid}: '
+            f'{skip_reason}'
+        )
+    # If user configured to require prefetch, silenty skip with an empty
+    # NoWaveformError.
+    require_prefetch = bool(
+        getattr(config, 'catalog_waveform_require_prefetch', False)
+    )
+    if require_prefetch:
+        raise NoWaveformError()
+    logger.warning(
+        '[rq:perf] Live FDSN fetch: evid=%s traceid=%s '
+        't0=%s t1=%s',
+        evid, traceid, t0, t1,
+    )
     try:
-        return get_waveform_from_client(traceid, t0, t1)
+        tr = get_waveform_from_client(traceid, t0, t1)
     except NoWaveformError as err:
-        msg = str(err).replace('\n', ' ')
+        try:
+            register_waveform_failure(
+                evid,
+                traceid,
+                t0,
+                t1,
+                _error_message(err),
+            )
+        except Exception as cache_err:  # pylint: disable=broad-except
+            logger.warning(
+                'Unable to update waveform failure cache: '
+                f'{_error_message(cache_err)}'
+            )
+        msg = _error_message(err)
         raise NoWaveformError(
             f'Unable to get waveform data for event {evid} '
             f'and trace_id {traceid}. '
             'Skipping event.\n'
             f'Error message: {msg}'
         ) from err
+    try:
+        clear_waveform_failure(evid, traceid, t0, t1)
+    except Exception as cache_err:  # pylint: disable=broad-except
+        logger.warning(
+            'Unable to clear waveform failure cache: '
+            f'{_error_message(cache_err)}'
+        )
+    _write_waveform_to_disk_cache(evid, traceid, t0, t1, tr)
+    return tr
 
 
 def _get_event_waveform_from_event_data_path(evid, traceid):
     """
-    Get a waveform for a given event and traceid by selecting a pre-cut
-    trace from the event_data_path defined in the config.
+    Get a waveform for an event by selecting a pre-cut local trace.
 
     :param evid: event id
     :type evid: str
@@ -199,8 +374,7 @@ def _get_event_waveform_from_event_data_path(evid, traceid):
 
 def get_event_waveform(ev):
     """
-    Get waveform for a given event and for trace_id defined in the config
-    or passed as a command line argument.
+    Get waveform for an event using the configured or requested trace id.
 
     :param ev: an event
     :type ev: RequakeEvent
@@ -210,6 +384,15 @@ def get_event_waveform(ev):
 
     :raises NoWaveformError: if no waveform data is available
     """
+    # Early exit: if this (evid, trace_id) pair has already exhausted
+    # its retry budget in the persistent negative cache, skip
+    # immediately without any I/O.
+    from ..wfcache import has_exhausted_failure
+    if ev.trace_id and has_exhausted_failure(ev.evid, ev.trace_id):
+        raise NoWaveformError(
+            f'Skipping event {ev.evid} / {ev.trace_id} '
+            '- persistent negative cache'
+        )
     evid = ev.evid
     ev_lat = ev.lat
     ev_lon = ev.lon
@@ -225,7 +408,7 @@ def get_event_waveform(ev):
     try:
         traceid_coords = get_traceid_coords(orig_time)
     except MetadataMismatchError as err:
-        msg = str(err).replace('\n', ' ')
+        msg = _error_message(err)
         raise NoWaveformError(
             f'Unable to get waveform data for event {evid} '
             f'and trace_id {traceid}. '
@@ -235,7 +418,7 @@ def get_event_waveform(ev):
     try:
         coords = traceid_coords[traceid]
     except KeyError as err:
-        msg = str(err).replace('\n', ' ')
+        msg = _error_message(err)
         raise NoWaveformError(
             f'No metadata for trace_id {traceid} '
             'in the metadata file. Skipping event.\n'
@@ -248,7 +431,7 @@ def get_event_waveform(ev):
             _get_arrivals_and_distance(
                 trace_lat, trace_lon, ev_lat, ev_lon, ev_depth, orig_time)
     except ValueError as err:
-        msg = str(err).replace('\n', ' ')
+        msg = _error_message(err)
         raise NoWaveformError(
             f'Unable to compute arrival times for event {evid} '
             f'and trace_id {traceid}. '
@@ -261,7 +444,8 @@ def get_event_waveform(ev):
     except NoWaveformError as err1:
         waveform_errors.append(str(err1))
         try:
-            tr = _get_event_waveform_from_client(evid, traceid, p_arrival_time)
+            tr = _get_event_waveform_from_client(
+                evid, traceid, p_arrival_time, orig_time)
         except NoWaveformError as err2:
             waveform_errors.append(str(err2))
             msg = ' '.join(waveform_errors)
@@ -343,11 +527,11 @@ def cc_waveform_pair(tr1, tr2, mode='events'):
             rq_exit(1)
     tr1 = process_waveforms(tr1)
     tr2 = process_waveforms(tr2)
-    shift = int(config.cc_max_shift/dt1)
+    shift = int(config.cc_max_shift / dt1)
     cc = correlate(tr1, tr2, shift)
     abs_max = bool(config.cc_allow_negative)
     lag, cc_max = xcorr_max(cc, abs_max)
-    lag_sec = lag*dt1
+    lag_sec = lag * dt1
     if mode != 'scan':
         return lag, lag_sec, cc_max
     # compute median absolute deviation for the non-zero portion of cc
@@ -379,7 +563,7 @@ def align_pair(tr1, tr2):
 
 def align_traces(st):
     """
-    Align traces in stream using cross-correlation.
+    Align traces in a stream using cross-correlation.
 
     :param st: stream of traces
     :type st: obspy.Stream
@@ -407,17 +591,18 @@ def _stack_traces(st):
     :rtype: obspy.Trace
     """
     tr_stack = st[0].copy()
+    tr_stack.data = tr_stack.data.astype(np.float64, copy=False)
     tr_stack.data *= 0.
     p_arrival = 0.
     s_arrival = 0.
     for tr in st:
         tr.detrend('demean')
-        data = tr.data
+        data = tr.data.astype(np.float64, copy=False)
         if config.normalize_traces_before_averaging:
             data /= abs(tr.max())
         # make sure that the two traces have the same length
         if len(data) < len(tr_stack.data):
-            data = np.pad(data, (0, len(tr_stack.data)-len(data)))
+            data = np.pad(data, (0, len(tr_stack.data) - len(data)))
         elif len(data) > len(tr_stack.data):
             data = data[:len(tr_stack.data)]
         tr_stack.data += data
@@ -436,7 +621,7 @@ def _stack_traces(st):
 
 def build_template(st, family):
     """
-    Build template by averaging traces.
+    Build a template by averaging traces.
 
     Assumes that the stream is realigned.
     """

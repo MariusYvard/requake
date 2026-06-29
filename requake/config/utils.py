@@ -13,10 +13,42 @@ import os
 import sys
 import locale
 import shutil
+import hashlib
+import threading
 from datetime import datetime
 from .configobj import ConfigObj, ParseError
 from .configobj.validate import Validator
 locale.setlocale(locale.LC_ALL, '')
+
+
+_seen_msgs = set()
+
+
+def log_once(logger, level, msg, *args, **kwargs):
+    """
+    Log a message only once.
+
+    :param logger: Logger object.
+    :type logger: logging.Logger
+    :param level: Log level.
+    :type level: str
+    :param msg: Message to log.
+    :type msg: str
+    :param args: Arguments for the message.
+    :param kwargs: Keyword arguments for the message.
+    """
+    text = str(msg)
+    digest = hashlib.blake2b(
+        text.encode('utf-8'),
+        digest_size=8,
+    ).digest()
+    if digest in _seen_msgs:
+        return
+    _seen_msgs.add(digest)
+    log_fn = getattr(logger, level, None)
+    if log_fn is None:
+        raise ValueError(f'Invalid log level: {level}')
+    log_fn(text, *args, **kwargs)
 
 
 def err_exit(msg):
@@ -43,6 +75,22 @@ def parse_configspec():
     return read_config(configspec_file)
 
 
+def confirm_action(prompt, default=False):
+    """
+    Ask for yes/no confirmation and return True for yes.
+
+    :param prompt: Prompt shown to the user.
+    :type prompt: str
+    :param default: Default answer when user provides empty input.
+    :type default: bool
+    :return: True if user confirms, False otherwise.
+    :rtype: bool
+    """
+    suffix = '[Y/n] ' if default else '[y/N] '
+    answer = input(f'{prompt} {suffix}').strip()
+    return answer.lower() in {'y', 'yes'} if answer else default
+
+
 def write_ok(filepath, force=False):
     """
     Check if a file can be written.
@@ -58,10 +106,9 @@ def write_ok(filepath, force=False):
     if force:
         return True
     if os.path.exists(filepath):
-        ans = input(
-            f'"{filepath}" already exists. Do you want to overwrite it? [y/N] '
+        return confirm_action(
+            f'"{filepath}" already exists. Do you want to overwrite it?'
         )
-        return ans in ['y', 'Y']
     return True
 
 
@@ -153,11 +200,11 @@ def update_config_file(config_file, configspec):
     mod_time = datetime.fromtimestamp(os.path.getmtime(config_file))
     mod_time_str = mod_time.strftime('%Y%m%d_%H%M%S')
     config_file_old = f'{config_file}.{mod_time_str}'
-    ans = input(
-        f'Ok to update {config_file}? [y/N]\n'
-        f'(Old file will be saved as {config_file_old}) '
+    should_update = confirm_action(
+        f'Ok to update {config_file}?\n'
+        f'(Old file will be saved as {config_file_old})'
     )
-    if ans not in ['y', 'Y']:
+    if not should_update:
         sys.exit(0)
     config_new = ConfigObj(configspec=configspec, default_encoding='utf8')
     config_new = read_config(None, configspec)
@@ -229,3 +276,62 @@ def manage_uncaught_exception(exception):
         'Thank you for your help!\n\n'
     )
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+#  Terminal progress utilities
+# ---------------------------------------------------------------------------
+
+_SPINNER_FRAMES = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+
+
+def status(msg):
+    """Print a progress message to stderr."""
+    print(msg, file=sys.stderr)
+    sys.stderr.flush()
+
+
+def run_with_spinner(message, func):
+    r"""Run *func* in a thread, showing a braille spinner on stderr.
+
+    The spinner animates on a single line via ``\r``.  When the
+    operation completes the line is cleared.  ``Ctrl+C`` is handled
+    so the terminal is left in a clean state.
+    """
+    done = threading.Event()
+    error = [None]
+    result = [None]
+
+    def _target():
+        try:
+            result[0] = func()
+        except Exception as exc:  # pylint: disable=broad-except
+            error[0] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+
+    i = 0
+    try:
+        while not done.wait(0.1):
+            print(
+                f'\r{_SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]}'
+                f' {message}',
+                file=sys.stderr, end='',
+            )
+            sys.stderr.flush()
+            i += 1
+        # Clear the spinner line.
+        print('\r' + ' ' * 79, file=sys.stderr, end='\r')
+        sys.stderr.flush()
+    except KeyboardInterrupt:
+        # Leave a clean line after the spinner.
+        print(file=sys.stderr)
+        sys.stderr.flush()
+        raise
+
+    if error[0] is not None:
+        raise error[0]
+    return result[0]

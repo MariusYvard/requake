@@ -62,11 +62,26 @@ def run():
     if args.action == 'build_templates':
         from .families import build_templates
         build_templates()
+    if args.action == 'wfcache_prefetch':
+        from .wfcache import wfcache_prefetch
+        wfcache_prefetch()
+    if args.action == 'wfcache_print':
+        from .wfcache import wfcache_print
+        wfcache_print()
+    if args.action == 'wfcache_inspect':
+        from .wfcache import wfcache_inspect
+        wfcache_inspect()
+    if args.action == 'wfcache_extract':
+        from .wfcache import wfcache_extract
+        wfcache_extract()
+    if args.action == 'wfcache_reset_failures':
+        from .wfcache import wfcache_reset_failures
+        wfcache_reset_failures()
     rq_exit(0)
 
 
 def main():
-    """Main entry point for Requake."""
+    """Run the main entry point for Requake."""
     try:
         run()
     # pylint: disable=broad-except

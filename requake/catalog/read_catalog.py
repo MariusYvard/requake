@@ -13,7 +13,9 @@ import os
 import logging
 import contextlib
 from ..config import config, rq_exit
-from .catalog import RequakeCatalog
+from ..database.db import get_db_path
+from ..database.catalog import write_catalog as write_stored_catalog
+from .catalog import RequakeEvent, RequakeCatalog
 from .read_catalog_from_fdsnws import read_catalog_from_fdsnws
 from .read_catalog_from_quakeml import read_catalog_from_quakeml
 from .read_catalog_from_csv import read_catalog_from_csv
@@ -45,7 +47,16 @@ def _read_catalog_from_file():
     # try to read the catalog as a FDSN text file
     with contextlib.suppress(ValueError):
         cat = RequakeCatalog()
-        cat.read(catalog_file)
+        with open(catalog_file, 'r', encoding='utf8') as fp:
+            for line in fp:
+                if not line:
+                    continue
+                if line[0] == '#':
+                    continue
+                ev = RequakeEvent()
+                ev.from_fdsn_text(line)
+                cat.append(ev)
+        cat.deduplicate()
         return cat
     # try to read the catalog as a CSV file
     # raises ValueError in case of failure
@@ -54,8 +65,7 @@ def _read_catalog_from_file():
 
 def _filter_catalog(catalog):
     """
-    Filter an event catalog, based on the criteria specified
-    in the configuration.
+    Filter an event catalog using the configured selection criteria.
 
     :param catalog: Event catalog.
     :type catalog: requake.catalog.RequakeCatalog
@@ -99,14 +109,17 @@ def read_catalog():
     :rtype: requake.catalog.RequakeCatalog
     """
     catalog = RequakeCatalog()
-    output_cat_file = config.scan_catalog_file
     nevs_read = 0
     if config.args.append:
         with contextlib.suppress(FileNotFoundError):
-            catalog = RequakeCatalog()
-            catalog.read(output_cat_file)
+            from .catalog import read_stored_catalog
+
+            catalog = read_stored_catalog()
             nevs_read = len(catalog)
-            logger.info(f'{nevs_read} events read from "{output_cat_file}"')
+            logger.info(
+                f'{nevs_read:n} events read from db file '
+                f'{get_db_path()}'
+            )
     logger.info('Reading catalog...')
     input_cat_file = config.args.catalog_file
     if input_cat_file is not None:
@@ -136,7 +149,10 @@ def read_catalog():
         logger.info(f'{nevs_dedup} duplicate events removed')
     # Sort catalog in increasing time order
     catalog.sort()
-    # Write catalog to output file
-    catalog.write(output_cat_file)
+    # Write catalog to the output database
+    write_stored_catalog(catalog)
     nevs_written = len(catalog) - nevs_read
-    logger.info(f'{nevs_written} events written to "{output_cat_file}"')
+    logger.info(
+        f'{nevs_written:n} events written to db file '
+        f'{get_db_path()}'
+    )

@@ -10,13 +10,16 @@ Setup functions for Requake.
     (https://www.gnu.org/licenses/gpl-3.0-standalone.html)
 """
 import contextlib
+import multiprocessing
 import sys
 import os
 import shutil
 import logging
 import signal
+import time
 import tqdm
 from .._version import get_versions
+from ..database.db import get_db_path
 from .config import config
 from .utils import (
     parse_configspec, read_config, validate_config, write_sample_config,
@@ -25,11 +28,21 @@ from .utils import (
 # Note: modules are lazily imported to speed up the startup time.
 # pylint: disable=relative-beyond-top-level,import-outside-toplevel
 
+
+def _memory_log_filter(record):
+    """Suppress [MEM] messages from TTY console handlers."""
+    return '[MEM]' not in record.getMessage()
+
+
 logger = None  # pylint: disable=invalid-name
 PYTHON_VERSION_STR = None
 NUMPY_VERSION_STR = None
 SCIPY_VERSION_STR = None
 OBSPY_VERSION_STR = None
+SIGINT_CONFIRM_WINDOW_S = 2.0
+SIGINT_PAUSE_POLL_S = 0.05
+_LAST_SIGINT_TS = None
+_SIGINT_PAUSE_UNTIL_TS = None
 
 
 def _check_library_versions():
@@ -92,6 +105,7 @@ def _setup_tqdm_logging(logger_root):
 
     class TqdmLoggingHandler(logging.Handler):
         """A logging handler that writes to tqdm."""
+
         def __init__(self, level=logging.NOTSET):
             super().__init__(level)
 
@@ -104,6 +118,7 @@ def _setup_tqdm_logging(logger_root):
                 self.handleError(record)
     console = TqdmLoggingHandler()
     console.setLevel(logging.INFO)
+    console.addFilter(_memory_log_filter)
     # Add logger color coding on all platforms but win32
     if sys.platform != 'win32' and sys.stdout.isatty():
         console.emit = _color_handler_emit(console.emit)
@@ -164,29 +179,17 @@ def _connect_station_dataselect():
     Connect to station and dataselect services.
 
     Those can be either FDSN web services or local files.
+    Both FDSN clients are created lazily on first use to avoid
+    unnecessary network I/O when data comes from local sources.
     """
-    from obspy.clients.fdsn import Client as FDSNClient
-    if config.station_metadata_path is None:
-        config.station_client = FDSNClient(config.fdsn_station_url)
-        logger.info(
-            f'Connected to FDSN station server: {config.fdsn_station_url}'
-        )
+    config.station_client = None
     config.dataselect_client = None
     if config.sds_data_path is not None:
         _connect_sds()
-    if config.event_data_path is not None:
-        return
-    config.dataselect_client = FDSNClient(config.fdsn_dataselect_url)
-    logger.info(
-        'Connected to FDSN dataselect server: '
-        f'{config.fdsn_dataselect_url}'
-    )
 
 
 def _connect_sds():
-    """
-    Connect to a local SeisComP Data Structure (SDS) archive.
-    """
+    """Connect to a local SeisComP Data Structure (SDS) archive."""
     from obspy.clients.filesystem.sds import Client as SDSClient
     _client = SDSClient(config.sds_data_path)
     all_nslc = _client.get_all_nslc()
@@ -261,9 +264,7 @@ def configure(args):
     # update config with the contents of config_obj
     config.update(config_obj)
     config.args = args
-    config.scan_catalog_file = os.path.join(
-        config.args.outdir, 'requake.catalog.txt'
-    )
+    config.args.outdir = os.path.abspath(config.args.outdir)
     config.scan_catalog_pairs_file = os.path.join(
         config.args.outdir, 'requake.event_pairs.csv'
     )
@@ -273,23 +274,12 @@ def configure(args):
     config.template_dir = os.path.join(
         config.args.outdir, 'templates'
     )
-    if (
-        args.action == 'read_catalog' and
-        not args.append and
-        not write_ok(config.scan_catalog_file, args.force)
-    ):
-        print('Exiting now.')
-        sys.exit(0)
-    if (
-        args.action == 'scan_catalog' and
-        not write_ok(config.scan_catalog_pairs_file, args.force)
-    ):
-        print('Exiting now.')
-        sys.exit(0)
-    if (
-        args.action == 'build_families' and
-        not write_ok(config.build_families_outfile, args.force)
-    ):
+    should_write_catalog = (
+        args.action == 'read_catalog'
+        and not args.append
+        and not write_ok(get_db_path(), args.force)
+    )
+    if should_write_catalog:
         print('Exiting now.')
         sys.exit(0)
     # config.inventory needs to exist
@@ -301,14 +291,14 @@ def configure(args):
     # save config to output dir (only for actions that write to outdir)
     actions_writing_to_outdir = (
         'read_catalog', 'scan_catalog', 'build_families',
-        'build_templates', 'scan_templates'
+        'build_templates', 'scan_templates', 'wfcache_prefetch'
     )
     if args.action in actions_writing_to_outdir:
         shutil.copy(args.configfile, args.outdir)
     _parse_catalog_options()
     actions_needing_fdsn_station_dataselect = (
         'scan_catalog', 'plot_pair', 'plot_families', 'build_templates',
-        'scan_templates'
+        'scan_templates', 'wfcache_prefetch'
     )
     try:
         if args.action in actions_needing_fdsn_station_dataselect:
@@ -344,8 +334,45 @@ def rq_exit(retval=0, abort=False, progname='requake'):
 
 
 def sigint_handler(_sig, _frame):
-    """Abort gracefully."""
-    rq_exit(1, abort=True)
+    """Ask for confirmation on first Ctrl+C and abort on second."""
+    global _LAST_SIGINT_TS  # pylint: disable=global-statement
+    global _SIGINT_PAUSE_UNTIL_TS  # pylint: disable=global-statement
+
+    if multiprocessing.current_process().name != 'MainProcess':
+        signal.default_int_handler(_sig, _frame)
+        return
+
+    now = time.monotonic()
+    if (
+        _LAST_SIGINT_TS is not None
+        and now - _LAST_SIGINT_TS <= SIGINT_CONFIRM_WINDOW_S
+    ):
+        rq_exit(1, abort=True)
+    _LAST_SIGINT_TS = now
+    _SIGINT_PAUSE_UNTIL_TS = now + SIGINT_CONFIRM_WINDOW_S
+    print(
+        '\nCtrl+C pressed. '
+        f'Press Ctrl+C again within {SIGINT_CONFIRM_WINDOW_S:g}s '
+        'to abort.'
+    )
 
 
-signal.signal(signal.SIGINT, sigint_handler)
+def wait_for_sigint_pause():
+    """Block while the first Ctrl+C confirmation window is active."""
+    global _SIGINT_PAUSE_UNTIL_TS  # pylint: disable=global-statement
+
+    if multiprocessing.current_process().name != 'MainProcess':
+        return
+    while _SIGINT_PAUSE_UNTIL_TS is not None:
+        if time.monotonic() >= _SIGINT_PAUSE_UNTIL_TS:
+            _SIGINT_PAUSE_UNTIL_TS = None
+            break
+        time.sleep(SIGINT_PAUSE_POLL_S)
+
+
+if multiprocessing.current_process().name == 'MainProcess':
+    signal.signal(signal.SIGINT, sigint_handler)
+else:
+    # Workers must ignore SIGINT from startup to avoid pool breakage during
+    # spawn, before the worker initializer runs.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)

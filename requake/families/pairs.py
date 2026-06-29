@@ -10,18 +10,14 @@ Build families of repeating earthquakes from a catalog of pairs.
     (https://www.gnu.org/licenses/gpl-3.0-standalone.html)
 """
 import logging
-import csv
-from obspy import UTCDateTime
-from ..config import config
-from ..formulas import float_or_none
+from numbers import Real
 from ..catalog import RequakeEvent
 logger = logging.getLogger(__name__.rsplit('.', maxsplit=1)[-1])
 
 
 class RequakeEventPair:
-    """
-    A pair of events.
-    """
+    """A pair of events."""
+
     def __init__(self, event1, event2, trace_id, lag_samples, lag_sec, cc_max):
         """
         Initialize a pair of events.
@@ -43,11 +39,11 @@ class RequakeEventPair:
             raise TypeError('event2 must be a RequakeEvent')
         if not isinstance(trace_id, str):
             raise TypeError('trace_id must be a string')
-        if not isinstance(lag_samples, (int, float)):
+        if not isinstance(lag_samples, Real):
             raise TypeError('lag_samples must be a number')
-        if not isinstance(lag_sec, (int, float)):
+        if not isinstance(lag_sec, Real):
             raise TypeError('lag_sec must be a number')
-        if not isinstance(cc_max, (int, float)):
+        if not isinstance(cc_max, Real):
             raise TypeError('cc_max must be a number')
         self.event1 = event1
         self.event2 = event2
@@ -57,6 +53,7 @@ class RequakeEventPair:
         self.cc_max = cc_max
 
     def __repr__(self):
+        """Return the debug representation of the pair."""
         return (
             f'RequakeEventPair(event1={self.event1}, event2={self.event2}, '
             f'trace_id={self.trace_id}, '
@@ -65,6 +62,7 @@ class RequakeEventPair:
         )
 
     def __str__(self):
+        """Return a compact string representation of the pair."""
         return (
             f'RequakeEventPair: {self.event1.evid} - {self.event2.evid}, '
             f'trace_id={self.trace_id}, '
@@ -73,59 +71,22 @@ class RequakeEventPair:
         )
 
 
-def read_pairs_file():
+def read_events_from_pairs(cc_min=None, cc_max=None):
     """
-    Read pairs file. Generate a RequakeEventPair object for each row.
+    Read events from stored event pairs.
 
-    :return: generator of RequakeEventPair objects
-    :rtype: generator
-
-    :raises FileNotFoundError: if the pairs file is not found
-    """
-    with open(config.scan_catalog_pairs_file, 'r', encoding='utf8') as fp:
-        reader = csv.DictReader(fp)
-        for row in reader:
-            evid1 = row['evid1']
-            ev1 = RequakeEvent(
-                evid=evid1,
-                orig_time=UTCDateTime(row['orig_time1']),
-                lon=float_or_none(row['lon1']),
-                lat=float_or_none(row['lat1']),
-                depth=float_or_none(row['depth_km1']),
-                mag_type=row['mag_type1'],
-                mag=float_or_none(row['mag1']),
-                trace_id=row['trace_id']
-            )
-            evid2 = row['evid2']
-            ev2 = RequakeEvent(
-                evid=evid2,
-                orig_time=UTCDateTime(row['orig_time2']),
-                lon=float_or_none(row['lon2']),
-                lat=float_or_none(row['lat2']),
-                depth=float_or_none(row['depth_km2']),
-                mag_type=row['mag_type2'],
-                mag=float_or_none(row['mag2']),
-                trace_id=row['trace_id']
-            )
-            trace_id = row['trace_id']
-            lag_samples = float(row['lag_samples'])
-            lag_sec = float(row['lag_sec'])
-            cc_max = float(row['cc_max'])
-            yield RequakeEventPair(
-                ev1, ev2, trace_id, lag_samples, lag_sec, cc_max)
-
-
-def read_events_from_pairs_file():
-    """
-    Read events from pairs file.
-
+    :param cc_min: If given, only use pairs with cc_max >= cc_min.
+    :type cc_min: float or None
+    :param cc_max: If given, only use pairs with cc_max <= cc_max.
+    :type cc_max: float or None
     :return: dictionary of events
     :rtype: dict
 
-    :raises FileNotFoundError: if the pairs file is not found
+    :raises PairsTableNotFoundError: if the stored pairs table is missing
     """
+    from ..database.pairs import read_pairs
     events = {}
-    for pair in read_pairs_file():
+    for pair in read_pairs(cc_min=cc_min, cc_max=cc_max):
         evid1 = pair.event1.evid
         try:
             ev1 = events[evid1]
